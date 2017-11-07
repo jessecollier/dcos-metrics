@@ -20,11 +20,17 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"strings"
+	"bufio"
+	"regexp"
 
 	log "github.com/Sirupsen/logrus"
 	plugin "github.com/dcos/dcos-metrics/plugins"
 	"github.com/dcos/dcos-metrics/producers"
 	"github.com/urfave/cli"
+
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 )
 
 var (
@@ -32,6 +38,18 @@ var (
 		cli.StringFlag{
 			Name:  "datadog-key",
 			Usage: "DataDog API Key",
+		},
+		cli.BoolFlag{
+			Name: "vvv",
+			Usage: "Enable printing metrics json for debug",
+		},
+		cli.StringSliceFlag{
+			Name:  "tag, t",
+			Usage: "extra tags",
+		},
+		cli.StringFlag{
+			Name:  "extra-tags-file, e",
+			Usage: "A file containing k=v or k:v one per line to add as tags to metrics",
 		},
 	}
 )
@@ -63,6 +81,8 @@ type DDResult struct {
 	Warnings []string `json:"warnings,omitempty"`
 }
 
+
+
 func main() {
 	log.Info("Starting Standalone DataDog DC/OS metrics plugin")
 	datadogPlugin, err := plugin.New(
@@ -86,7 +106,7 @@ func datadogConnector(metrics []producers.MetricsMessage, c *cli.Context) error 
 	log.Info("Transmitting metrics to DataDog")
 	datadogURL := fmt.Sprintf("https://app.datadoghq.com/api/v1/series?api_key=%s", c.String("datadog-key"))
 
-	result, err := postMetricsToDatadog(datadogURL, metrics)
+	result, err := postMetricsToDatadog(datadogURL, metrics, c)
 	if err != nil {
 		log.Errorf("Unexpected error while processing DataDog response: %s", err)
 		return nil
@@ -113,12 +133,16 @@ func datadogConnector(metrics []producers.MetricsMessage, c *cli.Context) error 
 	return nil
 }
 
-func postMetricsToDatadog(datadogURL string, metrics []producers.MetricsMessage) (*DDResult, error) {
-	series := messagesToSeries(metrics)
+func postMetricsToDatadog(datadogURL string, metrics []producers.MetricsMessage, c *cli.Context) (*DDResult, error) {
+	series := messagesToSeries(metrics, c)
 	b := new(bytes.Buffer)
 	err := json.NewEncoder(b).Encode(series)
 	if err != nil {
 		return nil, fmt.Errorf("Could not encode metrics to JSON: %v", err)
+	}
+
+	if c.Bool("vvv") {
+		log.Warnf("Json metrics '%v'", b)
 	}
 
 	res, err := http.Post(datadogURL, "application/json; charset=utf-8", b)
@@ -141,7 +165,7 @@ func postMetricsToDatadog(datadogURL string, metrics []producers.MetricsMessage)
 	return &result, nil
 }
 
-func messagesToSeries(messages []producers.MetricsMessage) *DDSeries {
+func messagesToSeries(messages []producers.MetricsMessage, c *cli.Context) *DDSeries {
 	series := new(DDSeries)
 
 	for _, message := range messages {
@@ -154,18 +178,43 @@ func messagesToSeries(messages []producers.MetricsMessage) *DDSeries {
 			}
 		}
 
-		for name, value := range dimensions.Labels {
-			addMessageTag(name, value)
+		// Disable because we dont want labels leaking to DD
+		// if c.Bool('enable-labels') {
+		// 	for name, value := range dimensions.Labels {
+		// 		addMessageTag(name, value)
+		// 	}
+		// }
+
+		// the first string before . is our marathon name
+		executorName := strings.Split(dimensions.ExecutorID, ".")
+		addMessageTag("service", executorName[0])
+
+		// Here to add instance id
+		ec2client := ec2metadata.New(session.New())
+		ec2InstanceIdentifyDocument, _ := ec2client.GetInstanceIdentityDocument()
+		addMessageTag("instance_id", ec2InstanceIdentifyDocument.InstanceID)
+
+		// Disabled due to high cardinality
+		//addMessageTag("mesosId", dimensions.MesosID)
+		//addMessageTag("clusterId", dimensions.ClusterID)
+		//addMessageTag("containerId", dimensions.ContainerID)
+		//addMessageTag("executorId", dimensions.ExecutorID)
+		//addMessageTag("frameworkName", dimensions.FrameworkName)
+		//addMessageTag("frameworkId", dimensions.FrameworkID)
+		//addMessageTag("frameworkRole", dimensions.FrameworkRole)
+		//addMessageTag("frameworkPrincipal", dimensions.FrameworkPrincipal)
+		addMessageTag("slave_ip", dimensions.Hostname)
+
+		// Look for extra k=v or k:v in a file and add them to tags
+		if len(c.String("extra-tags-file")) > 0 {
+			messageTags = append(messageTags, extraTagsFromFile(c)...)
 		}
-		addMessageTag("mesosId", dimensions.MesosID)
-		addMessageTag("clusterId", dimensions.ClusterID)
-		addMessageTag("containerId", dimensions.ContainerID)
-		addMessageTag("executorId", dimensions.ExecutorID)
-		addMessageTag("frameworkName", dimensions.FrameworkName)
-		addMessageTag("frameworkId", dimensions.FrameworkID)
-		addMessageTag("frameworkRole", dimensions.FrameworkRole)
-		addMessageTag("frameworkPrincipal", dimensions.FrameworkPrincipal)
-		addMessageTag("hostname", dimensions.Hostname)
+
+		for _, tag := range c.StringSlice("tag") {
+			if len(tag) > 0 {
+				messageTags = append(messageTags, tag)
+			}
+		}
 
 		for _, datapoint := range message.Datapoints {
 			m, err := datapointToDDMetric(datapoint, messageTags, host)
@@ -180,6 +229,29 @@ func messagesToSeries(messages []producers.MetricsMessage) *DDSeries {
 	return series
 }
 
+// Import tags from KV file
+// file must be newline separated k=v or k:v
+func extraTagsFromFile(c *cli.Context) (extraTags []string) {
+	extra, err := ioutil.ReadFile(c.String("extra-tags-file"))
+	if err != nil {
+		return extraTags
+	}
+
+	var validEquals = regexp.MustCompile(`^[a-zA-Z0-9_]+=[a-zA-Z0-9]+$`)
+	var validColon = regexp.MustCompile(`^[a-zA-Z0-9_]+:[a-zA-Z0-9]+$`)
+
+	scanner := bufio.NewScanner(strings.NewReader(string(extra)))
+	for scanner.Scan() {
+		switch {
+		case validEquals.MatchString(scanner.Text()):
+			extraTags = append(extraTags, strings.Replace(scanner.Text(), "=", ":", -1))
+		case validColon.MatchString(scanner.Text()):
+			extraTags = append(extraTags, scanner.Text())
+		}
+	}
+	return extraTags
+}
+
 func datapointToDDMetric(datapoint producers.Datapoint, messageTags []string, host *string) (*DDMetric, error) {
 	t, err := plugin.ParseDatapointTimestamp(datapoint.Timestamp)
 	if err != nil {
@@ -192,12 +264,16 @@ func datapointToDDMetric(datapoint producers.Datapoint, messageTags []string, ho
 	}
 
 	datapointTags := []string{}
-	addDatapointTag := func(key, value string) {
-		datapointTags = append(datapointTags, fmt.Sprintf("%s:%s", key, value))
-	}
-	for name, value := range datapoint.Tags {
-		addDatapointTag(name, value)
-	}
+	// addDatapointTag := func(key, value string) {
+	// 	datapointTags = append(datapointTags, fmt.Sprintf("%s:%s", key, value))
+	// }
+
+	// Disable datapoint tags due to high cardinality
+	// see collectors/mesos/agent/metrics.go for what tags are excluded
+	//    -JC 11/6/17
+	// for name, value := range datapoint.Tags {
+	// 	addDatapointTag(name, value)
+	// }
 
 	metric := DDMetric{
 		Metric: datapoint.Name,

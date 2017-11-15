@@ -15,22 +15,22 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"strings"
-	"bufio"
 	"regexp"
+	"strings"
 
 	log "github.com/Sirupsen/logrus"
 	plugin "github.com/dcos/dcos-metrics/plugins"
 	"github.com/dcos/dcos-metrics/producers"
 	"github.com/urfave/cli"
 
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
+	"github.com/aws/aws-sdk-go/aws/session"
 )
 
 var (
@@ -40,7 +40,7 @@ var (
 			Usage: "DataDog API Key",
 		},
 		cli.BoolFlag{
-			Name: "vvv",
+			Name:  "vvv",
 			Usage: "Enable printing metrics json for debug",
 		},
 		cli.StringSliceFlag{
@@ -50,6 +50,10 @@ var (
 		cli.StringFlag{
 			Name:  "extra-tags-file, e",
 			Usage: "A file containing k=v or k:v one per line to add as tags to metrics",
+		},
+		cli.StringFlag{
+			Name:  "metric-prefix",
+			Usage: "Datadog metric name prefix",
 		},
 	}
 )
@@ -217,7 +221,7 @@ func messagesToSeries(messages []producers.MetricsMessage, c *cli.Context) *DDSe
 		}
 
 		for _, datapoint := range message.Datapoints {
-			m, err := datapointToDDMetric(datapoint, messageTags, host)
+			m, err := datapointToDDMetric(datapoint, messageTags, host, c)
 			if err != nil {
 				log.Error(err)
 				continue
@@ -252,7 +256,7 @@ func extraTagsFromFile(c *cli.Context) (extraTags []string) {
 	return extraTags
 }
 
-func datapointToDDMetric(datapoint producers.Datapoint, messageTags []string, host *string) (*DDMetric, error) {
+func datapointToDDMetric(datapoint producers.Datapoint, messageTags []string, host *string, c *cli.Context) (*DDMetric, error) {
 	t, err := plugin.ParseDatapointTimestamp(datapoint.Timestamp)
 	if err != nil {
 		return nil, fmt.Errorf("Could not parse timestamp '%s': %v", datapoint.Timestamp, err)
@@ -275,8 +279,13 @@ func datapointToDDMetric(datapoint producers.Datapoint, messageTags []string, ho
 	// 	addDatapointTag(name, value)
 	// }
 
+	metricName := datapoint.Name
+	if len(c.String("metric-prefix")) > 0 {
+		metricName = strings.Join([]string{c.String("metric-prefix"), metricName}, ".")
+	}
+
 	metric := DDMetric{
-		Metric: datapoint.Name,
+		Metric: metricName,
 		Points: []DDDataPoint{{float64(t.Unix()), v}},
 		Tags:   append(messageTags, datapointTags...),
 		Unit:   datapoint.Unit,
